@@ -6,6 +6,9 @@ edition = "2018"
 
 [dependencies]
 tracing-core = { version = "0.1", path = "../tracing-core" }
+hashbrown = "0.5"
+crossbeam-utils = "0.6"
+parking_lot = "0.8"
 
 [dev-dependencies]
 tracing-log = { path = "../tracing-log" }
