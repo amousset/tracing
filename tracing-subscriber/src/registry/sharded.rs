@@ -8,7 +8,7 @@ use parking_lot::{ReentrantMutex};
 use crossbeam_utils::sync::ShardedLock;
 
 pub struct Registry<T> {
-    shards: ShardedLock<HashMap<Thread, Shard<T>>>,
+    shards: ShardedLock<Shards<T>>,
 }
 
 #[derive(Clone, Hash, PartialEq, Eq)]
@@ -16,26 +16,43 @@ struct Thread {
     id: usize,
 }
 
+struct Shards<T>(HashMap<Thread, Shard<T>>);
+
 struct Shard<T> {
     spans: ReentrantMutex<RefCell<HashMap<Id, T>>>,
 }
 
 impl<T: 'static> Registry<T> {
-    fn with_shard<I>(&self, f: impl FnMut(Shard<T>) -> I) -> I {
+    fn with_shard<I>(&self, mut f: impl FnMut(&mut HashMap<Id, T>) -> I) -> I {
         // fast path --- the shard already exists
         let thread = Thread::current();
-        let fast = {
-            let shards = self.shards.read().unwrap();
-            shards.get(&thread).map(&mut f)
-        };
-        if let Some(r) = fast {
+
+        if let Some(r) = self.shards
+            .read()
+            .with_shard(thread, &mut f)
+        {
             return r
-        } else {
-            // slow path --- need to insert a shard.
-            let mut shards = self.shards.write().unwrap();
-            shards.insert(thread, Shard::new());
-            shards.get(&thread).map(&mut f).unwrap()
         }
+        // slow path --- need to insert a shard.
+        // TODO(eliza): figure out a good way to propagate poison panics _if_ we are
+        // not unwinding?
+        self.shards.write()
+            .unwrap()
+            .new_shard_for(thread)
+            .with_shard(thread, &mut f)
+            .unwrap()
+    }
+}
+
+impl<T> Shards<T> {
+    fn with_shard<I>(&self, thread: &Thread, f: &mut impl FnMut(&mut HashMap<Id, T>) -> I) -> Option<I> {
+        let mut shard = self.0.get(thread).ok()?.lock();
+        Some(f(*lock.borrow_mut()))
+    }
+
+    fn new_shard_for(&mut self, thread: Thread) -> &mut Self {
+        self.0.insert(thread, Shard::new());
+        self
     }
 }
 
