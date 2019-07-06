@@ -1,18 +1,20 @@
 use hashbrown::HashMap;
 use tracing_core::span::Id;
 use std::{
+    mem,
     thread,
     sync::atomic::{AtomicUsize, Ordering},
     cell::{RefCell, Cell},
 };
-use parking_lot::{ReentrantMutex};
-use crossbeam_utils::sync::ShardedLock;
+use parking_lot::{ReentrantMutex, ReentrantMutexGuard, MappedReentrantMutexGuard};
+use crossbeam_utils::sync::{ShardedLock, ShardedLockReadGuard};
+use owning_ref::OwningHandle;
 
 pub struct Registry<T> {
     shards: ShardedLock<Shards<T>>,
 }
 
-#[derive(Clone, Hash, PartialEq, Eq)]
+#[derive(Copy, Clone, Hash, PartialEq, Eq)]
 struct Thread {
     id: usize,
 }
@@ -23,10 +25,19 @@ struct Shard<T> {
     spans: ReentrantMutex<RefCell<HashMap<Id, T>>>,
 }
 
-// enum Slot<T> {
-//     Present(T),
-//     Stolen(Thread),
-// }
+pub struct Ref<'a, T> {
+    inner: OwningHandle<
+        ShardedLockReadGuard<'a, Shard<T>>,
+        MappedReentrantMutexGuard<'a, &'a mut T>
+    >,
+}
+
+
+#[derive(Clone, Debug)]
+enum Slot<T> {
+    Present(T),
+    Stolen(Thread),
+}
 
 fn handle_poison<T>(result: Result<T, ()>) -> Option<T> {
     if thread::panicking() {
@@ -53,15 +64,20 @@ impl<T> Registry<T> {
             .with_shard(&thread, &mut f).ok_or(())
     }
 
+    pub fn get_span<'a>(&'a self, id: &Id) -> Option<Ref<'a, T>> {
+        unimplemented!()
+    }
+
     pub fn with_span<I>(&self, id: &Id, f: impl FnOnce(&mut T) -> I) -> Option<I> {
         let mut f = Some(f);
         let res = self.with_shard(|shard| {
-            shard.get_mut(id).map(|span| {
+            shard.get_mut(id).and_then(Slot::get_mut).map(|span| {
                 let mut f = f.take().expect("called twice!");
                 f(span)
             })
         });
         handle_poison(res)?
+
         // TODO: steal
     }
 
@@ -107,6 +123,20 @@ impl<T> Shard<T> {
             spans: ReentrantMutex::new(RefCell::new(HashMap::new()))
         }
     }
+
+    fn span<'a>(&'a self, id: &Id) -> Option<ReentrantMutexGuard<'a, &mut T>> {
+        let guard = self.spans.lock();
+        ReentrantMutexGuard::try_map(
+            guard,
+            move |spans| spans.get(id).and_then(Slot::get_mut)
+        ).ok()
+    }
+
+    fn try_steal(&self, id: &Id) -> Option<Slot<T>> {
+        let mut lock = self.spans.lock();
+        let slot = self.spans.get_mut(id)?;
+        mem::replace(slot, Slot::Stolen(Thread::current()))
+    }
 }
 
 impl Thread {
@@ -126,6 +156,15 @@ impl Thread {
                 id
             }
         })
+    }
+}
+
+impl<T> Slot<T> {
+    fn get_mut(&mut self) -> Option<&mut T> {
+        match self {
+            Slot::Present(ref mut span) => Some(span),
+            _ => None,
+        }
     }
 }
 
