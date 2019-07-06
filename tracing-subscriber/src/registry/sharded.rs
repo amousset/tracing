@@ -1,6 +1,7 @@
 use hashbrown::HashMap;
 use tracing_core::span::Id;
 use std::{
+    thread,
     sync::atomic::{AtomicUsize, Ordering},
     cell::{RefCell, Cell},
 };
@@ -22,32 +23,76 @@ struct Shard<T> {
     spans: ReentrantMutex<RefCell<HashMap<Id, T>>>,
 }
 
-impl<T: 'static> Registry<T> {
-    fn with_shard<I>(&self, mut f: impl FnMut(&mut HashMap<Id, T>) -> I) -> I {
+// enum Slot<T> {
+//     Present(T),
+//     Stolen(Thread),
+// }
+
+fn handle_poison<T>(result: Result<T, ()>) -> Option<T> {
+    if thread::panicking() {
+        result.ok()
+    } else {
+        Some(result.expect("registry poisoned"))
+    }
+}
+
+impl<T> Registry<T> {
+    fn with_shard<I>(&self, mut f: impl FnOnce(&mut HashMap<Id, T>) -> I) -> Result<I, ()> {
         // fast path --- the shard already exists
         let thread = Thread::current();
+        let mut f = Some(f);
 
-        if let Some(r) = self.shards
-            .read()
-            .with_shard(thread, &mut f)
+        if let Some(r) = self.shards.read().map_err(|_|())?
+            .with_shard(&thread, &mut f)
         {
-            return r
+            return Ok(r)
         }
         // slow path --- need to insert a shard.
-        // TODO(eliza): figure out a good way to propagate poison panics _if_ we are
-        // not unwinding?
-        self.shards.write()
-            .unwrap()
-            .new_shard_for(thread)
-            .with_shard(thread, &mut f)
-            .unwrap()
+        self.shards.write().map_err(|_|())?
+            .new_shard_for(thread.clone())
+            .with_shard(&thread, &mut f).ok_or(())
+    }
+
+    pub fn with_span<I>(&self, id: &Id, f: impl FnOnce(&mut T) -> I) -> Option<I> {
+        let mut f = Some(f);
+        let res = self.with_shard(|shard| {
+            shard.get_mut(id).map(|span| {
+                let mut f = f.take().expect("called twice!");
+                f(span)
+            })
+        });
+        handle_poison(res)?
+        // TODO: steal
+    }
+
+    pub fn insert(&self, id: Id, span: T) -> &Self {
+        let ok = self.with_shard(move |shard| {
+            let _ = shard.insert(id, span);
+        });
+        if !thread::panicking() {
+            ok.expect("poisoned");
+        }
+
+        self
+    }
+
+    pub fn new() -> Self {
+        Self {
+            shards: ShardedLock::new(Shards(HashMap::new()))
+        }
     }
 }
 
 impl<T> Shards<T> {
-    fn with_shard<I>(&self, thread: &Thread, f: &mut impl FnMut(&mut HashMap<Id, T>) -> I) -> Option<I> {
-        let mut shard = self.0.get(thread).ok()?.lock();
-        Some(f(*lock.borrow_mut()))
+    fn with_shard<I>(
+        &self,
+        thread: &Thread,
+        f: &mut Option<impl FnOnce(&mut HashMap<Id, T>)-> I>,
+    ) -> Option<I> {
+        let mut lock = self.0.get(thread)?.spans.lock();
+        let mut shard = lock.borrow_mut();
+        let mut f = f.take()?;
+        Some(f(&mut *shard))
     }
 
     fn new_shard_for(&mut self, thread: Thread) -> &mut Self {
@@ -81,5 +126,27 @@ impl Thread {
                 id
             }
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn basically_works() {
+        let registry: Registry<usize> = Registry::new();
+        registry
+            .insert(Id::from_u64(1), 1)
+            .insert(Id::from_u64(2), 2);
+
+        assert_eq!(registry.with_span(&Id::from_u64(1), |&mut s| s), Some(1));
+        assert_eq!(registry.with_span(&Id::from_u64(2), |&mut s| s), Some(2));
+
+        registry.insert(Id::from_u64(3), 3);
+
+        assert_eq!(registry.with_span(&Id::from_u64(1), |&mut s| s), Some(1));
+        assert_eq!(registry.with_span(&Id::from_u64(2), |&mut s| s), Some(2));
+        assert_eq!(registry.with_span(&Id::from_u64(3), |&mut s| s), Some(3));
     }
 }
