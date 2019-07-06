@@ -8,6 +8,7 @@ edition = "2018"
 tracing-core = "0.1"
 hashbrown = "0.5"
 crossbeam-utils = "0.6"
+crossbeam-skiplist = { git = "https://github.com/crossbeam-rs/crossbeam"}
 parking_lot = "0.8"
 owning_ref = "0.4.0"
 
