@@ -8,14 +8,13 @@ use std::{
 };
 use parking_lot::{ReentrantMutex, ReentrantMutexGuard, MappedReentrantMutexGuard};
 use crossbeam_utils::sync::{ShardedLock, ShardedLockReadGuard};
-use crossbeam_skiplist::{SkipMap, map};
 use owning_ref::OwningHandle;
 
 pub struct Registry<T> {
-    shards: SkipMap<Thread, Shard<T>>,
+    shards: ShardedLock<Shards<T>>,
 }
 
-#[derive(Copy, Clone, Hash, PartialEq, Eq, Ord, PartialOrd)]
+#[derive(Copy, Clone, Hash, PartialEq, Eq)]
 struct Thread {
     id: usize,
 }
@@ -27,7 +26,10 @@ struct Shard<T> {
 }
 
 pub struct Ref<'a, T> {
-    inner: MappedReentrantMutexGuard<'a, &'a mut T>
+    inner: OwningHandle<
+        ShardedLockReadGuard<'a, Shard<T>>,
+        MappedReentrantMutexGuard<'a, &'a mut T>
+    >,
 }
 
 
@@ -37,88 +39,83 @@ enum Slot<T> {
     Stolen(Thread),
 }
 
+fn handle_poison<T>(result: Result<T, ()>) -> Option<T> {
+    if thread::panicking() {
+        result.ok()
+    } else {
+        Some(result.expect("registry poisoned"))
+    }
+}
+
 impl<T> Registry<T> {
-    fn local_shard(&self) -> map::Entry<Thread, Shard<T>> {
+    fn with_shard<I>(&self, mut f: impl FnOnce(&mut HashMap<Id, T>) -> I) -> Result<I, ()> {
+        // fast path --- the shard already exists
         let thread = Thread::current();
-        if let Some(shard) = self.shards.get(&thread) {
-            return shard;
-        } else {
-            self.shards.insert(thread, Shard::new())
+        let mut f = Some(f);
+
+        if let Some(r) = self.shards.read().map_err(|_|())?
+            .with_shard(&thread, &mut f)
+        {
+            return Ok(r)
         }
+        // slow path --- need to insert a shard.
+        self.shards.write().map_err(|_|())?
+            .new_shard_for(thread.clone())
+            .with_shard(&thread, &mut f).ok_or(())
     }
 
-    pub fn span(&self, id: &Id) -> Option<Ref<'a, T>> {
-        match self.local_shard().value().
+    pub fn get_span<'a>(&'a self, id: &Id) -> Option<Ref<'a, T>> {
+        unimplemented!()
     }
 
-    // fn with_shard<I>(&self, mut f: impl FnOnce(&mut HashMap<Id, T>) -> I) -> Result<I, ()> {
-    //     // fast path --- the shard already exists
-    //     let thread = Thread::current();
-    //     let mut f = Some(f);
+    pub fn with_span<I>(&self, id: &Id, f: impl FnOnce(&mut T) -> I) -> Option<I> {
+        let mut f = Some(f);
+        let res = self.with_shard(|shard| {
+            shard.get_mut(id).and_then(Slot::get_mut).map(|span| {
+                let mut f = f.take().expect("called twice!");
+                f(span)
+            })
+        });
+        handle_poison(res)?
 
-    //     if let Some(r) = self.shards.read().map_err(|_|())?
-    //         .with_shard(&thread, &mut f)
-    //     {
-    //         return Ok(r)
-    //     }
-    //     // slow path --- need to insert a shard.
-    //     self.shards.write().map_err(|_|())?
-    //         .new_shard_for(thread.clone())
-    //         .with_shard(&thread, &mut f).ok_or(())
-    // }
+        // TODO: steal
+    }
 
-    // pub fn get_span<'a>(&'a self, id: &Id) -> Option<Ref<'a, T>> {
-    //     unimplemented!()
-    // }
+    pub fn insert(&self, id: Id, span: T) -> &Self {
+        let ok = self.with_shard(move |shard| {
+            let _ = shard.insert(id, span);
+        });
+        if !thread::panicking() {
+            ok.expect("poisoned");
+        }
 
-    // pub fn with_span<I>(&self, id: &Id, f: impl FnOnce(&mut T) -> I) -> Option<I> {
-    //     let mut f = Some(f);
-    //     let res = self.with_shard(|shard| {
-    //         shard.get_mut(id).and_then(Slot::get_mut).map(|span| {
-    //             let mut f = f.take().expect("called twice!");
-    //             f(span)
-    //         })
-    //     });
-    //     handle_poison(res)?
-
-    //     // TODO: steal
-    // }
-
-    // pub fn insert(&self, id: Id, span: T) -> &Self {
-    //     let ok = self.with_shard(move |shard| {
-    //         let _ = shard.insert(id, span);
-    //     });
-    //     if !thread::panicking() {
-    //         ok.expect("poisoned");
-    //     }
-
-    //     self
-    // }
+        self
+    }
 
     pub fn new() -> Self {
         Self {
-            shards: SkipMap::new(),
+            shards: ShardedLock::new(Shards(HashMap::new()))
         }
     }
 }
 
-// impl<T> Shards<T> {
-//     fn with_shard<I>(
-//         &self,
-//         thread: &Thread,
-//         f: &mut Option<impl FnOnce(&mut HashMap<Id, T>)-> I>,
-//     ) -> Option<I> {
-//         let mut lock = self.0.get(thread)?.spans.lock();
-//         let mut shard = lock.borrow_mut();
-//         let mut f = f.take()?;
-//         Some(f(&mut *shard))
-//     }
+impl<T> Shards<T> {
+    fn with_shard<I>(
+        &self,
+        thread: &Thread,
+        f: &mut Option<impl FnOnce(&mut HashMap<Id, T>)-> I>,
+    ) -> Option<I> {
+        let mut lock = self.0.get(thread)?.spans.lock();
+        let mut shard = lock.borrow_mut();
+        let mut f = f.take()?;
+        Some(f(&mut *shard))
+    }
 
-//     fn new_shard_for(&mut self, thread: Thread) -> &mut Self {
-//         self.0.insert(thread, Shard::new());
-//         self
-//     }
-// }
+    fn new_shard_for(&mut self, thread: Thread) -> &mut Self {
+        self.0.insert(thread, Shard::new());
+        self
+    }
+}
 
 impl<T> Shard<T> {
     fn new() -> Self {
@@ -126,8 +123,6 @@ impl<T> Shard<T> {
             spans: ReentrantMutex::new(RefCell::new(HashMap::new()))
         }
     }
-
-    fn slot(&self)
 
     fn span<'a>(&'a self, id: &Id) -> Option<ReentrantMutexGuard<'a, &mut T>> {
         let guard = self.spans.lock();
