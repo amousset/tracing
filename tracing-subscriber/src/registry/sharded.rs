@@ -3,8 +3,12 @@ use tracing_core::span::Id;
 use std::{
     mem,
     thread,
-    sync::atomic::{AtomicUsize, Ordering},
-    cell::{RefCell, Cell},
+    sync::{
+        atomic::{AtomicUsize, Ordering},
+        PoisonError,
+    },
+    cell::{RefCell, Cell, Ref, RefMut, UnsafeCell},
+    fmt,
 };
 use parking_lot::{ReentrantMutex, ReentrantMutexGuard, MappedReentrantMutexGuard};
 use crossbeam_utils::sync::{ShardedLock, ShardedLockReadGuard};
@@ -14,7 +18,7 @@ pub struct Registry<T> {
     shards: ShardedLock<Shards<T>>,
 }
 
-#[derive(Copy, Clone, Hash, PartialEq, Eq)]
+#[derive(Copy, Clone, Hash, PartialEq, Eq, Debug)]
 struct Thread {
     id: usize,
 }
@@ -22,69 +26,99 @@ struct Thread {
 struct Shards<T>(HashMap<Thread, Shard<T>>);
 
 struct Shard<T> {
-    spans: ReentrantMutex<RefCell<HashMap<Id, T>>>,
+    spans: ReentrantMutex<UnsafeCell<Spans<T>>>,
 }
 
-pub struct Ref<'a, T> {
-    inner: OwningHandle<
-        ShardedLockReadGuard<'a, Shard<T>>,
-        MappedReentrantMutexGuard<'a, &'a mut T>
-    >,
+pub struct Span<'a, T> {
+    inner: MappedReentrantMutexGuard<'a, Ref<'a, T>>,
 }
 
+pub struct SpanMut<'a, T> {
+    inner: MappedReentrantMutexGuard<'a, RefMut<'a, T>>,
+}
+
+#[derive(Debug)]
+enum Error {
+    Poisoned,
+    BadInsert,
+}
 
 #[derive(Clone, Debug)]
 enum Slot<T> {
-    Present(T),
+    Present(RefCell<T>),
     Stolen(Thread),
 }
 
-fn handle_poison<T>(result: Result<T, ()>) -> Option<T> {
-    if thread::panicking() {
-        result.ok()
-    } else {
-        Some(result.expect("registry poisoned"))
+type Spans<T> = HashMap<Id, Slot<T>>;
+
+fn handle_err<T>(result: Result<T, Error>) -> Option<T> {
+    match result {
+        Ok(e) => Some(e),
+        Err(e) if thread::panicking() => {
+            println!("{}", e);
+            None
+        },
+        Err(e) =>  panic!("{}", e),
     }
 }
 
 impl<T> Registry<T> {
-    fn with_shard<I>(&self, mut f: impl FnOnce(&mut HashMap<Id, T>) -> I) -> Result<I, ()> {
+    fn with_local<'a, I>(&'a self, mut f: impl FnOnce(&'a Shard<T>) -> I) -> Result<I, Error> {
         // fast path --- the shard already exists
         let thread = Thread::current();
         let mut f = Some(f);
 
-        if let Some(r) = self.shards.read().map_err(|_|())?
+        if let Some(r) = self.shards.read()?
             .with_shard(&thread, &mut f)
         {
             return Ok(r)
         }
         // slow path --- need to insert a shard.
-        self.shards.write().map_err(|_|())?
+        self.shards.write()?
             .new_shard_for(thread.clone())
-            .with_shard(&thread, &mut f).ok_or(())
+            .with_shard(&thread, &mut f).ok_or(Error::BadInsert)
     }
 
-    pub fn get_span<'a>(&'a self, id: &Id) -> Option<Ref<'a, T>> {
+    pub fn span(&self, id: &Id) -> Option<Span<T>> {
+        let local = self.with_local(|shard| { shard.span(id) });
+        let local = handle_err(local)?;
+        match local {
+            Some(slot) => {
+                let inner = MappedReentrantMutexGuard::try_map(slot, |slot| slot.as_ref().as_ref()).ok()?;
+                return Some(Span { inner });
+            },
+            None => {
+                // TODO: steal
+            }
+        }
+
+        None
+    }
+
+    pub fn span_mut<'a>(&'a self, id: &Id) -> Option<SpanMut<'a, T>> {
+        // let res = self.with_local(|shard| {
+        //     shard.span(id).map(|inner| Ref { inner })
+        // });
+        // handle_err(res)?
         unimplemented!()
     }
 
     pub fn with_span<I>(&self, id: &Id, f: impl FnOnce(&mut T) -> I) -> Option<I> {
-        let mut f = Some(f);
-        let res = self.with_shard(|shard| {
-            shard.get_mut(id).and_then(Slot::get_mut).map(|span| {
-                let mut f = f.take().expect("called twice!");
-                f(span)
-            })
-        });
-        handle_poison(res)?
+        // let mut f = Some(f);
+        // let res = self.with_shard(|shard| {
+        //     shard.get_mut(id).and_then(Slot::get_mut).map(|span| {
+        //         let mut f = f.take().expect("called twice!");
+        //         f(span)
+        //     })
+        // });
+        // handle_poison(res)?
 
         // TODO: steal
+        unimplemented!()
     }
 
     pub fn insert(&self, id: Id, span: T) -> &Self {
-        let ok = self.with_shard(move |shard| {
-            let _ = shard.insert(id, span);
-        });
+        let ok = self.with_local(move |shard| { shard.insert(id, span) });
         if !thread::panicking() {
             ok.expect("poisoned");
         }
@@ -100,15 +134,21 @@ impl<T> Registry<T> {
 }
 
 impl<T> Shards<T> {
-    fn with_shard<I>(
-        &self,
+    fn with_shard<'a, I>(
+        &'a self,
         thread: &Thread,
-        f: &mut Option<impl FnOnce(&mut HashMap<Id, T>)-> I>,
+        f: &mut Option<impl FnOnce(&'a Shard<T>)-> I>,
     ) -> Option<I> {
-        let mut lock = self.0.get(thread)?.spans.lock();
-        let mut shard = lock.borrow_mut();
-        let mut f = f.take()?;
-        Some(f(&mut *shard))
+        let shard = self.0.get(thread)?;
+        let mut f = match f.take() {
+            None if thread::panicking() => {
+                println!("with_shard: closure called twice; this is a bug");
+                return None;
+            },
+            None => panic!("with_shard: closure called twice; this is a bug"),
+            Some(f) => f,
+        };
+        Some(f(&*shard))
     }
 
     fn new_shard_for(&mut self, thread: Thread) -> &mut Self {
@@ -120,22 +160,43 @@ impl<T> Shards<T> {
 impl<T> Shard<T> {
     fn new() -> Self {
         Self {
-            spans: ReentrantMutex::new(RefCell::new(HashMap::new()))
+            spans: ReentrantMutex::new(UnsafeCell::new(HashMap::new()))
         }
     }
 
-    fn span<'a>(&'a self, id: &Id) -> Option<ReentrantMutexGuard<'a, &mut T>> {
+    fn insert(&self, id: Id, span: T) -> Option<T> {
+        let guard = self.spans.lock();
+        let spans = unsafe {
+            // this is safe as the mutex ensures that the map is not mutated
+            // concurrently, and the mutable ref will not leave this function.
+            &mut *(guard.get())
+        };
+        spans.insert(id, Slot::Present(RefCell::new(span))).and_then(Slot::into_option)
+    }
+
+    // fn spans_mut<'a>(&'a self) -> MappedReentrantMutexGuard<'a, RefMut<'a, Spans<T>>> {
+    //     let guard = self.spans.lock();
+    //     ReentrantMutexGuard::map(guard, RefCell::borrow_mut)
+    // }
+    fn span<'a>(&'a self, id: &Id) -> Option<MappedReentrantMutexGuard<'a, Slot<T>>> {
         let guard = self.spans.lock();
         ReentrantMutexGuard::try_map(
             guard,
-            move |spans| spans.get(id).and_then(Slot::get_mut)
+            move |spans| {
+                let spans = unsafe { &mut *(guard.get()) };
+                spans.get_mut(id)
+            }
         ).ok()
     }
 
     fn try_steal(&self, id: &Id) -> Option<Slot<T>> {
-        let mut lock = self.spans.lock();
-        let slot = self.spans.get_mut(id)?;
-        mem::replace(slot, Slot::Stolen(Thread::current()))
+        let guard = self.spans.lock();
+        let spans = unsafe {
+            // this is safe as the mutex ensures that the map is not mutated
+            // concurrently, and the mutable ref will not leave this function.
+            &mut *(guard.get())
+        };
+        spans.insert(id.clone(), Slot::Stolen(Thread::current()))
     }
 }
 
@@ -160,10 +221,43 @@ impl Thread {
 }
 
 impl<T> Slot<T> {
-    fn get_mut(&mut self) -> Option<&mut T> {
+
+    fn as_ref<'a>(&'a self) -> Option<Ref<'a, T>> {
         match self {
-            Slot::Present(ref mut span) => Some(span),
+            Slot::Present(ref span) => Some(span.borrow()),
             _ => None,
+        }
+    }
+
+    fn as_mut<'a>(&'a self) -> Option<RefMut<'a, T>> {
+        match self {
+            Slot::Present(ref span) => Some(span.borrow_mut()),
+            _ => None,
+        }
+    }
+
+    fn into_option(self) -> Option<T> {
+        match self {
+            Slot::Present(span) => Some(span.into_inner()),
+            _ => None,
+        }
+    }
+}
+
+
+impl<T> From<PoisonError<T>> for Error {
+    fn from(_: PoisonError<T>) -> Self {
+        Error::Poisoned
+    }
+}
+
+impl fmt::Display for Error {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        match self {
+            Error::Poisoned =>
+                "registry poisoned: another thread panicked inside".fmt(f),
+            Error::BadInsert =>
+                "new thread was inserted but did not exist; this is a bug".fmt(f),
         }
     }
 }
@@ -179,13 +273,13 @@ mod tests {
             .insert(Id::from_u64(1), 1)
             .insert(Id::from_u64(2), 2);
 
-        assert_eq!(registry.with_span(&Id::from_u64(1), |&mut s| s), Some(1));
-        assert_eq!(registry.with_span(&Id::from_u64(2), |&mut s| s), Some(2));
+        assert_eq!(registry.span(&Id::from_u64(1)), Some(1));
+        assert_eq!(registry.span(&Id::from_u64(2)), Some(2));
 
         registry.insert(Id::from_u64(3), 3);
 
-        assert_eq!(registry.with_span(&Id::from_u64(1), |&mut s| s), Some(1));
-        assert_eq!(registry.with_span(&Id::from_u64(2), |&mut s| s), Some(2));
-        assert_eq!(registry.with_span(&Id::from_u64(3), |&mut s| s), Some(3));
+        assert_eq!(registry.span(&Id::from_u64(1)), Some(1));
+        assert_eq!(registry.span(&Id::from_u64(2)), Some(2));
+        assert_eq!(registry.span(&Id::from_u64(3)), Some(3));
     }
 }
