@@ -43,13 +43,7 @@ enum Error {
     BadInsert,
 }
 
-#[derive(Clone, Debug)]
-enum Slot<T> {
-    Present(RefCell<T>),
-    Stolen(Thread),
-}
-
-type Spans<T> = HashMap<Id, Slot<T>>;
+type Spans<T> = HashMap<Id, RefCell<T>>;
 
 fn handle_err<T>(result: Result<T, Error>) -> Option<T> {
     match result {
@@ -71,9 +65,15 @@ impl<T> Registry<T> {
         if let Some(r) = self.shards.read()?
             .with_shard(&thread, &mut f)
         {
-            return Ok(r)
+            Ok(r)
+        } else {
+            // slow path --- need to insert a shard.
+            self.with_new_local(&thread, &mut f)
         }
-        // slow path --- need to insert a shard.
+    }
+
+    #[cold]
+    fn with_new_local<'a, I>(&'a self, thread: &Thread, f: &mut Option<impl FnOnce(&'a Shard<T>)-> I>,) -> Result<I, Error> {
         self.shards.write()?
             .new_shard_for(thread.clone())
             .with_shard(&thread, &mut f).ok_or(Error::BadInsert)
@@ -84,7 +84,7 @@ impl<T> Registry<T> {
         let local = handle_err(local)?;
         match local {
             Some(slot) => {
-                let inner = MappedReentrantMutexGuard::try_map(slot, |slot| slot.as_ref().as_ref()).ok()?;
+                let inner = MappedReentrantMutexGuard::try_map(slot, |slot| slot.as_ref()).ok()?;
                 return Some(Span { inner });
             },
             None => {
@@ -171,14 +171,14 @@ impl<T> Shard<T> {
             // concurrently, and the mutable ref will not leave this function.
             &mut *(guard.get())
         };
-        spans.insert(id, Slot::Present(RefCell::new(span))).and_then(Slot::into_option)
+        spans.insert(id, RefCell::new(span))
     }
 
     // fn spans_mut<'a>(&'a self) -> MappedReentrantMutexGuard<'a, RefMut<'a, Spans<T>>> {
     //     let guard = self.spans.lock();
     //     ReentrantMutexGuard::map(guard, RefCell::borrow_mut)
     // }
-    fn span<'a>(&'a self, id: &Id) -> Option<MappedReentrantMutexGuard<'a, Slot<T>>> {
+    fn span<'a>(&'a self, id: &Id) -> Option<MappedReentrantMutexGuard<'a, RefMut<T>>> {
         let guard = self.spans.lock();
         ReentrantMutexGuard::try_map(
             guard,
