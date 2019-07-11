@@ -3,8 +3,8 @@ use tracing_core::span::Id;
 
 pub mod filter;
 pub mod layer;
-pub mod registry;
 pub mod prelude;
+pub mod registry;
 // pub use compose::Composed;
 
 // pub mod filter;
